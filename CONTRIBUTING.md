@@ -14,6 +14,7 @@ Consult the Table of Contents below, and jump to the desired section.
   - [Enterprise Edition](#enterprise-edition)
   - [Community Edition](#community-edition)
 - [Where to report bugs?](#where-to-report-bugs)
+- [Where to submit feature requests?](#where-to-submit-feature-requests)
 - [Contributing](#contributing)
   - [Improving the documentation](#improving-the-documentation)
   - [Proposing a new plugin](#proposing-a-new-plugin)
@@ -82,6 +83,17 @@ to respect the GitHub issue template, and include:
 If you wish, you are more than welcome to propose a patch to fix the issue!
 See the [Submit a patch](#submitting-a-patch) section for more information
 on how to best do so.
+
+[Back to TOC](#table-of-contents)
+
+
+## Where to submit feature requests?
+
+You can [submit an issue](https://github.com/Kong/kong/issues/new) for feature
+requests. Please add as much detail as you can when doing so.
+
+You are also welcome to propose patches adding new features. See the section
+on [Submitting a patch](#submitting-a-patch) for details.
 
 [Back to TOC](#table-of-contents)
 
@@ -182,9 +194,10 @@ If you are asked to update your patch by a reviewer, please do so! Remember:
 you are probably the one in need of it. You must be prepared to apply changes
 to it if necessary.
 
-If your Pull Request was accepted, congratulations! You are now an official
-contributor of Kong. Get in touch with us to receive your very own
-[Contributor T-shirt](#contributor-t-shirt)!
+If your Pull Request was accepted and fixes a bug, adds functionality, or
+makes it significantly easier to use or understand Kong, congratulations!
+You are now an official contributor to Kong. Get in touch with us to receive
+your very own [Contributor T-shirt](#contributor-t-shirt)!
 
 Your change will be included in the subsequent release Changelog, and we will
 not forget to include your name if you are an external contributor. :wink:
@@ -222,9 +235,9 @@ commits, as long as their atomicity is respected. This means that no unrelated
 changes should be included in a commit.
 
 For example: you are writing a patch to fix a bug, but in your endeavour, you
-spot another bug. **Do not fix both bugs in the same commit!**. Finish your
+spot another bug. **Do not fix both bugs in the same commit!** Finish your
 work on the initial bug, propose your patch, and come back to the second bug
-later on. This is also valid for unrelated style fixes, refactorings, etc...
+later on. This is also valid for unrelated style fixes, refactors, etc...
 
 You should use your best judgment when facing such decisions. A good approach
 for this is to put yourself in the shoes of the person who will review your
@@ -502,10 +515,11 @@ language you are using. :smile:
 
 ### Contributor T-shirt
 
-If your Pull Request to [Kong/kong](https://github.com/Kong/kong) was accepted,
-congratulations, you are eligible to receive the very special Contributor
-T-shirt! Go ahead and fill out the [Contributors Submissions
-form](https://goo.gl/forms/5w6mxLaE4tz2YM0L2).
+If your Pull Request to [Kong/kong](https://github.com/Kong/kong) was
+accepted, and it fixes a bug, adds functionality, or makes it significantly
+easier to use or understand Kong, congratulations! You are eligible to
+receive the very special Contributor T-shirt! Go ahead and fill out the
+[Contributors Submissions form](https://goo.gl/forms/5w6mxLaE4tz2YM0L2).
 
 Proudly wear your T-shirt and show it to us by tagging
 [@thekonginc](https://twitter.com/thekonginc) on Twitter!
@@ -631,6 +645,27 @@ local t = { foo = "hello", bar = "world" }
 
 
 ### Strings
+
+**Do** favor the use of double quotes in all Lua code (plain files and
+`*_by_lua_block` directives):
+
+```lua
+-- bad
+local str = 'hello'
+
+-- good
+local str = "hello"
+```
+
+If a string contains double quotes, **do** favor long bracket strings:
+
+```lua
+-- bad
+local str = "message: \"hello\""
+
+-- good
+local str = [[message: "hello"]]
+```
 
 When using the concatenation operator, **do** insert spaces around it:
 

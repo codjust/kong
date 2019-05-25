@@ -1,4 +1,8 @@
+require("resty.core")
+
+
 local ran_before
+
 
 return function(options)
 
@@ -55,7 +59,7 @@ return function(options)
     if options.cli then
       -- ngx.shared.DICT proxy
       -- https://github.com/bsm/fakengx/blob/master/fakengx.lua
-      -- with minor fixes and addtions such as exptime
+      -- with minor fixes and additions such as exptime
       --
       -- See https://github.com/openresty/resty-cli/pull/12
       -- for a definitive solution of using shms in CLI
@@ -189,9 +193,11 @@ return function(options)
     _G.math.randomseed = function()
       local seed = seeds[ngx.worker.pid()]
       if not seed then
-        if not options.cli and ngx.get_phase() ~= "init_worker" then
+        if not options.cli
+          and (ngx.get_phase() ~= "init_worker" and ngx.get_phase() ~= "init")
+        then
           ngx.log(ngx.WARN, debug.traceback("math.randomseed() must be " ..
-              "called in init_worker context", 2))
+              "called in init or init_worker context", 2))
         end
 
         local bytes, err = util.get_rand_bytes(8)
@@ -274,9 +280,11 @@ return function(options)
 
     local function resolve_connect(f, sock, host, port, opts)
       if sub(host, 1, 5) ~= "unix:" then
-        host, port = toip(host, port)
+        local try_list
+        host, port, try_list = toip(host, port)
         if not host then
-          return nil, "[toip() name lookup failed]: " .. tostring(port)
+          return nil, "[cosocket] DNS resolution failed: " .. tostring(port) ..
+                      ". Tried: " .. tostring(try_list)
         end
       end
 

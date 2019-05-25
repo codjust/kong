@@ -85,12 +85,12 @@ do
   local function load_upstream_into_memory(upstream_id)
     log(DEBUG, "fetching upstream: ", tostring(upstream_id))
 
-    local upstream, err = singletons.dao.upstreams:find_all {id = upstream_id}
+    local upstream, err = singletons.db.upstreams:select({id = upstream_id})
     if not upstream then
       return nil, err
     end
 
-    return upstream[1]  -- searched by id, so only 1 row in the returned set
+    return upstream
   end
   _load_upstream_into_memory = load_upstream_into_memory
 
@@ -105,15 +105,17 @@ end
 local fetch_target_history
 do
   ------------------------------------------------------------------------------
-  -- Loads the target history from the DAO.
+  -- Loads the target history from the DB.
   -- @param upstream_id Upstream uuid for which to load the target history
   -- @return The target history array, with target entity tables.
   local function load_targets_into_memory(upstream_id)
-    log(DEBUG, "fetching targets for upstream: ",tostring(upstream_id))
+    log(DEBUG, "fetching targets for upstream: ", tostring(upstream_id))
 
-    local target_history, err = singletons.dao.targets:find_all {upstream_id = upstream_id}
+    local target_history, err, err_t =
+      singletons.db.targets:select_by_upstream_raw({ id = upstream_id }, 1000)
+
     if not target_history then
-      return nil, err
+      return nil, err, err_t
     end
 
     -- perform some raw data updates
@@ -122,14 +124,7 @@ do
       local port
       target.name, port = string.match(target.target, "^(.-):(%d+)$")
       target.port = tonumber(port)
-
-      -- need exact order, so create sort-key by created-time and uuid
-      target.order = target.created_at .. ":" .. target.id
     end
-
-    table.sort(target_history, function(a,b)
-      return a.order < b.order
-    end)
 
     return target_history
   end
@@ -137,7 +132,7 @@ do
 
 
   ------------------------------------------------------------------------------
-  -- Fetch target history, from cache or the DAO.
+  -- Fetch target history, from cache or the DB.
   -- @param upstream The upstream entity object
   -- @return The target history array, with target entity tables.
   fetch_target_history = function(upstream)
@@ -200,7 +195,7 @@ end
 
 local create_balancer
 do
-  local ring_balancer = require "resty.dns.balancer"
+  local ring_balancer = require "resty.dns.balancer.ring"
 
   local create_healthchecker
   do
@@ -211,10 +206,11 @@ do
     -- or removed to a balancer.
     -- @param balancer the ring balancer object that triggers this callback.
     -- @param action "added" or "removed"
+    -- @param address balancer address object
     -- @param ip string
     -- @param port number
     -- @param hostname string
-    local function ring_balancer_callback(balancer, action, ip, port, hostname)
+    local function ring_balancer_callback(balancer, action, address, ip, port, hostname)
       local healthchecker = healthcheckers[balancer]
       if action == "added" then
         local ok, err = healthchecker:add_target(ip, port, hostname)
@@ -269,21 +265,24 @@ do
       -- The lifetime of the healthchecker is based on that of the balancer.
       healthcheckers[balancer] = hc
 
-      balancer.report_http_status = function(ip, port, status)
+      balancer.report_http_status = function(handle, status)
+        local ip, port = handle.address.ip, handle.address.port
         local _, err = hc:report_http_status(ip, port, status, "passive")
         if err then
           log(ERR, "[healthchecks] failed reporting status: ", err)
         end
       end
 
-      balancer.report_tcp_failure = function(ip, port)
+      balancer.report_tcp_failure = function(handle)
+        local ip, port = handle.address.ip, handle.address.port
         local _, err = hc:report_tcp_failure(ip, port, nil, "passive")
         if err then
           log(ERR, "[healthchecks] failed reporting status: ", err)
         end
       end
 
-      balancer.report_timeout = function(ip, port)
+      balancer.report_timeout = function(handle)
+        local ip, port = handle.address.ip, handle.address.port
         local _, err = hc:report_timeout(ip, port, "passive")
         if err then
           log(ERR, "[healthchecks] failed reporting status: ", err)
@@ -298,11 +297,26 @@ do
       if not healthcheck then
         healthcheck = require("resty.healthcheck") -- delayed initialization
       end
+
+      -- Do not run active healthchecks in `stream` module
+      local checks = upstream.healthchecks
+      if ngx.config.subsystem == "stream"
+         and (checks.active.healthy.interval ~= 0
+              or checks.active.unhealthy.interval ~= 0)
+      then
+        log(ngx.INFO, "[healthchecks] disabling active healthchecks in ",
+                      "stream module")
+        checks = pl_tablex.deepcopy(checks)
+        checks.active.healthy.interval = 0
+        checks.active.unhealthy.interval = 0
+      end
+
       local healthchecker, err = healthcheck.new({
         name = upstream.name,
         shm_name = "kong_healthchecks",
-        checks = upstream.healthchecks,
+        checks = checks,
       })
+
       if not healthchecker then
         log(ERR, "[healthchecks] error creating health checker: ", err)
         return nil, err
@@ -339,7 +353,7 @@ do
   end
 
   ------------------------------------------------------------------------------
-  -- @param upstream (table) The upstream data
+  -- @param upstream (table) A db.upstreams entity
   -- @param recreate (boolean, optional) create new balancer even if one exists
   -- @param history (table, optional) history of target updates
   -- @param start (integer, optional) from where to start reading the history
@@ -364,6 +378,7 @@ do
         wheelSize = upstream.slots,
         dns = dns_client,
       })
+
     if not balancer then
       return nil, err
     end
@@ -455,42 +470,38 @@ end
 
 local get_all_upstreams
 do
-  ------------------------------------------------------------------------------
-  -- Implements a simple dictionary with all upstream-ids indexed
-  -- by their name.
-  -- @return The upstreams dictionary, a map with upstream names as string keys
-  -- and upstream entity tables as values, or nil+error
   local function load_upstreams_dict_into_memory()
-    log(DEBUG, "fetching all upstreams")
-    local upstreams, err = singletons.dao.upstreams:find_all()
-    if err then
-      return nil, err
-    end
-
-    -- build a dictionary, indexed by the upstream name
     local upstreams_dict = {}
-    for _, up in ipairs(upstreams) do
+    -- build a dictionary, indexed by the upstream name
+    for up, err in singletons.db.upstreams:each(1000) do
+      if err then
+        log(CRIT, "could not obtain list of upstreams: ", err)
+        return nil
+      end
+
       upstreams_dict[up.name] = up.id
     end
-
     return upstreams_dict
   end
   _load_upstreams_dict_into_memory = load_upstreams_dict_into_memory
 
 
+  local opts = { neg_ttl = 10 }
+
+
   ------------------------------------------------------------------------------
-  -- Finds and returns an upstream entity. This function covers
-  -- caching, invalidation, db access, et al.
-  -- @param upstream_name string.
-  -- @return upstream table, or `false` if not found, or nil+error
+  -- Implements a simple dictionary with all upstream-ids indexed
+  -- by their name.
+  -- @return The upstreams dictionary (a map with upstream names as string keys
+  -- and upstream entity tables as values), or nil+error
   get_all_upstreams = function()
-    local upstreams_dict, err = singletons.cache:get("balancer:upstreams", nil,
+    local upstreams_dict, err = singletons.cache:get("balancer:upstreams", opts,
                                                 load_upstreams_dict_into_memory)
     if err then
       return nil, err
     end
 
-    return upstreams_dict
+    return upstreams_dict or {}
   end
 end
 
@@ -525,6 +536,7 @@ local function get_balancer(target, no_create)
   -- do not apply here
   local hostname = target.host
 
+
   -- first go and find the upstream object, from cache or the db
   local upstream, err = get_upstream_by_name(hostname)
   if upstream == false then
@@ -556,10 +568,9 @@ end
 --------------------------------------------------------------------------------
 -- Called on any changes to a target.
 -- @param operation "create", "update" or "delete"
--- @param upstream Target table with `upstream_id` field
+-- @param target Target table with `upstream.id` field
 local function on_target_event(operation, target)
-  local upstream_id = target.upstream_id
-
+  local upstream_id = target.upstream.id
   singletons.cache:invalidate_local("balancer:targets:" .. upstream_id)
 
   local upstream = get_upstream_by_id(upstream_id)
@@ -640,19 +651,22 @@ end
 -- Will only be called once per request, on first try.
 -- @param upstream the upstream enity
 -- @return integer value or nil if there is no hash to calculate
-local create_hash = function(upstream)
+local create_hash = function(upstream, ctx)
   local hash_on = upstream.hash_on
   if hash_on == "none" then
     return -- not hashing, exit fast
   end
 
-  local ctx = ngx.ctx
   local identifier
   local header_field_name = "hash_on_header"
 
   for _ = 1,2 do
 
-    if hash_on == "consumer" then
+   if hash_on == "consumer" then
+      if not ctx then
+        ctx = ngx.ctx
+      end
+
       -- consumer, fallback to credential
       identifier = (ctx.authenticated_consumer or EMPTY_T).id or
                    (ctx.authenticated_credential or EMPTY_T).id
@@ -672,6 +686,10 @@ local create_hash = function(upstream)
       -- If the cookie doesn't exist, create one and store in `ctx`
       -- to be added to the "Set-Cookie" header in the response
       if not identifier then
+        if not ctx then
+          ctx = ngx.ctx
+        end
+
         identifier = utils.uuid()
 
         ctx.balancer_data.hash_cookie = {
@@ -707,7 +725,7 @@ local function init()
 
   local upstreams, err = get_all_upstreams()
   if not upstreams then
-    log(CRIT, "failed loading initial list of upstreams: " .. err)
+    log(CRIT, "failed loading initial list of upstreams: ", err)
     return
   end
 
@@ -741,11 +759,8 @@ end
 --
 -- @param target the data structure as defined in `core.access.before` where
 -- it is created.
--- @param silent Do not produce body data (to be used in OpenResty contexts
--- which do not support sending it)
 -- @return true on success, nil+error message+status code otherwise
-local function execute(target)
-
+local function execute(target, ctx)
   if target.type ~= "name" then
     -- it's an ip address (v4 or v6), so nothing we can do...
     target.ip = target.host
@@ -780,22 +795,23 @@ local function execute(target)
       -- only add it if it doesn't exist, in case a plugin inserted one
       hash_value = target.hash_value
       if not hash_value then
-        hash_value = create_hash(upstream)
+        hash_value = create_hash(upstream, ctx)
         target.hash_value = hash_value
       end
     end
   end
 
-  local ip, port, hostname
+  local ip, port, hostname, handle
   if balancer then
     -- have to invoke the ring-balancer
-    ip, port, hostname = balancer:getPeer(hash_value,
-                                          target.try_count,
-                                          dns_cache_only)
+    ip, port, hostname, handle = balancer:getPeer(dns_cache_only,
+                                          target.balancer_handle,
+                                          hash_value)
     if not ip and port == "No peers are available" then
       return nil, "failure to get a peer from the ring-balancer", 503
     end
     target.hash_value = hash_value
+    target.balancer_handle = handle
 
   else
     -- have to do a regular DNS lookup
@@ -803,7 +819,7 @@ local function execute(target)
     ip, port, try_list = toip(target.host, target.port, dns_cache_only)
     hostname = target.host
     if not ip then
-      log(ERR, "[dns] ", port, ". Tried: ", tostring(try_list))
+      log(ERR, "DNS resolution failed: ", port, ". Tried: ", tostring(try_list))
       if port == "dns server error: 3 name error" or
          port == "dns client error: 101 empty record received" then
         return nil, "name resolution failed", 503

@@ -7,15 +7,22 @@
 -- @module kong.client
 
 
+local utils = require "kong.tools.utils"
 local phase_checker = require "kong.pdk.private.phases"
 
 
 local ngx = ngx
 local tonumber = tonumber
+local check_phase = phase_checker.check
 local check_not_phase = phase_checker.check_not
 
 
 local PHASES = phase_checker.phases
+local AUTH_AND_LATER = phase_checker.new(PHASES.access,
+                                         PHASES.header_filter,
+                                         PHASES.body_filter,
+                                         PHASES.log)
+local TABLE_OR_NIL = { ["table"] = true, ["nil"] = true }
 
 
 local function new(self)
@@ -118,6 +125,120 @@ local function new(self)
     check_not_phase(PHASES.init_worker)
 
     return tonumber(ngx.var.remote_port)
+  end
+
+
+  ---
+  -- Returns the credentials of the currently authenticated consumer.
+  -- If not set yet, it returns `nil`.
+  -- @function kong.client.get_credential
+  -- @phases access, header_filter, body_filter, log
+  -- @return the authenticated credential
+  -- @usage
+  -- local credential = kong.client.get_credential()
+  -- if credential then
+  --   consumer_id = credential.consumer_id
+  -- else
+  --   -- request not authenticated yet
+  -- end
+  function _CLIENT.get_credential()
+    check_phase(AUTH_AND_LATER)
+
+    return ngx.ctx.authenticated_credential
+  end
+
+
+  ---
+  -- Returns the `consumer` entity of the currently authenticated consumer.
+  -- If not set yet, it returns `nil`.
+  -- @function kong.client.get_consumer
+  -- @phases access, header_filter, body_filter, log
+  -- @treturn table the authenticated consumer entity
+  -- @usage
+  -- local consumer = kong.client.get_consumer()
+  -- if consumer then
+  --   consumer_id = consumer.id
+  -- else
+  --   -- request not authenticated yet, or a credential
+  --   -- without a consumer (external auth)
+  -- end
+  function _CLIENT.get_consumer()
+    check_phase(AUTH_AND_LATER)
+
+    return ngx.ctx.authenticated_consumer
+  end
+
+
+  ---
+  -- Sets the authenticated consumer and/or credential for the current request.
+  -- While both `consumer` and `credential` can be `nil`, it is required
+  -- that at least one of them exists. Otherwise this function will throw an
+  -- error.
+  -- @function kong.client.authenticate
+  -- @phases access
+  -- @tparam table|nil consumer The consumer to set. Note: if no
+  -- value is provided, then any existing value will be cleared!
+  -- @tparam table|nil credential The credential to set. Note: if
+  -- no value is provided, then any existing value will be cleared!
+  -- @usage
+  -- -- assuming `credential` and `consumer` have been set by some authentication code
+  -- kong.client.authenticate(consumer, credentials)
+  function _CLIENT.authenticate(consumer, credential)
+    check_phase(PHASES.access)
+
+    if not TABLE_OR_NIL[type(consumer)] then
+      error("consumer must be a table or nil", 2)
+    elseif not TABLE_OR_NIL[type(credential)] then
+      error("credential must be a table or nil", 2)
+    elseif credential == nil and consumer == nil then
+      error("either credential or consumer must be provided", 2)
+    end
+
+    local ctx = ngx.ctx
+    ctx.authenticated_consumer = consumer
+    ctx.authenticated_credential = credential
+  end
+
+
+  ---
+  -- Returns the protocol matched by the current route (`"http"`, `"https"`, `"tcp"` or
+  -- `"tls"`), or `nil`, if no route has been matched, which can happen when dealing with
+  -- erroneous requests.
+  -- @function kong.client.get_protocol
+  -- @phases access, header_filter, body_filter, log
+  -- @tparam [opt] allow_terminated boolean. If set, the `X-Forwarded-Proto` header will be checked when checking for https
+  -- @treturn string|nil `"http"`, `"https"`, `"tcp"`, `"tls"` or `nil`
+  -- @treturn nil|err nil if success, or error message if failure
+  -- @usage
+  -- kong.client.get_protocol() -- "http"
+  function _CLIENT.get_protocol(allow_terminated)
+    check_phase(AUTH_AND_LATER)
+
+    local route = ngx.ctx.route
+    if not route then
+      return nil, "No active route found"
+    end
+
+    local protocols = route.protocols
+    if #protocols == 1 then
+      return protocols[1]
+    end
+
+    if ngx.config.subsystem == "http" then
+      local is_trusted = kong.ip.is_trusted(kong.client.get_ip())
+      local is_https, err = utils.check_https(is_trusted, allow_terminated)
+      if err then
+        return nil, err
+      end
+
+      return is_https and "https" or "http"
+    end
+    -- else subsystem is stream
+
+    local balancer_data = ngx.ctx.balancer_data
+    local is_tls = balancer_data and balancer_data.scheme == "tls" and balancer_data.ssl_ctx
+
+    return is_tls and "tls" or "tcp"
   end
 
 

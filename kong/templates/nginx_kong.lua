@@ -42,8 +42,8 @@ lua_shared_dict kong_cassandra      5m;
 lua_socket_log_errors off;
 > if lua_ssl_trusted_certificate then
 lua_ssl_trusted_certificate '${{LUA_SSL_TRUSTED_CERTIFICATE}}';
-lua_ssl_verify_depth ${{LUA_SSL_VERIFY_DEPTH}};
 > end
+lua_ssl_verify_depth ${{LUA_SSL_VERIFY_DEPTH}};
 
 # injected nginx_http_* directives
 > for _, el in ipairs(nginx_http_directives)  do
@@ -66,7 +66,9 @@ upstream kong_upstream {
     balancer_by_lua_block {
         Kong.balancer()
     }
+> if upstream_keepalive > 0 then
     keepalive ${{UPSTREAM_KEEPALIVE}};
+> end
 }
 
 server {
@@ -85,7 +87,7 @@ server {
 > if proxy_ssl_enabled then
     ssl_certificate ${{SSL_CERT}};
     ssl_certificate_key ${{SSL_CERT_KEY}};
-    ssl_protocols TLSv1.1 TLSv1.2;
+    ssl_protocols TLSv1.1 TLSv1.2 TLSv1.3;
     ssl_certificate_by_lua_block {
         Kong.ssl_certificate()
     }
@@ -108,7 +110,7 @@ server {
 > end
 
     # injected nginx_proxy_* directives
-> for _, el in ipairs(nginx_proxy_directives)  do
+> for _, el in ipairs(nginx_proxy_directives) do
     $(el.name) $(el.value);
 > end
 
@@ -200,7 +202,7 @@ server {
 > if admin_ssl_enabled then
     ssl_certificate ${{ADMIN_SSL_CERT}};
     ssl_certificate_key ${{ADMIN_SSL_CERT_KEY}};
-    ssl_protocols TLSv1.1 TLSv1.2;
+    ssl_protocols TLSv1.1 TLSv1.2 TLSv1.3;
 
     ssl_session_cache shared:SSL:10m;
     ssl_session_timeout 10m;
@@ -209,7 +211,7 @@ server {
 > end
 
     # injected nginx_admin_* directives
-> for _, el in ipairs(nginx_admin_directives)  do
+> for _, el in ipairs(nginx_admin_directives) do
     $(el.name) $(el.value);
 > end
 

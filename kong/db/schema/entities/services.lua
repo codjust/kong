@@ -1,15 +1,12 @@
 local typedefs = require "kong.db.schema.typedefs"
+local Schema = require "kong.db.schema"
+local url = require "socket.url"
 
 
-local function validate_name(name)
-  if not string.match(name, "^[%w%.%-%_~]+$") then
-    return nil,
-           "invalid value '" .. name ..
-           "': it must only contain alphanumeric and '., -, _, ~' characters"
-  end
-
-  return true
-end
+local nonzero_timeout = Schema.define {
+  type = "integer",
+  between = { 1, math.pow(2, 31) - 2 },
+}
 
 
 return {
@@ -19,19 +16,46 @@ return {
 
   fields = {
     { id              = typedefs.uuid, },
-    { created_at      = { type = "integer", timestamp = true, auto = true }, },
-    { updated_at      = { type = "integer", timestamp = true, auto = true }, },
-    { name            = { type = "string", unique = true,
-                          custom_validator = validate_name }, },
+    { created_at      = typedefs.auto_timestamp_s },
+    { updated_at      = typedefs.auto_timestamp_s },
+    { name            = typedefs.name },
     { retries         = { type = "integer", default = 5, between = { 0, 32767 } }, },
     -- { tags          = { type = "array", array = { type = "string" } }, },
     { protocol        = typedefs.protocol { required = true, default = "http" } },
     { host            = typedefs.host { required = true } },
     { port            = typedefs.port { required = true, default = 80 }, },
     { path            = typedefs.path },
-    { connect_timeout = typedefs.timeout { default = 60000 }, },
-    { write_timeout   = typedefs.timeout { default = 60000 }, },
-    { read_timeout    = typedefs.timeout { default = 60000 }, },
+    { connect_timeout = nonzero_timeout { default = 60000 }, },
+    { write_timeout   = nonzero_timeout { default = 60000 }, },
+    { read_timeout    = nonzero_timeout { default = 60000 }, },
+    { tags            = typedefs.tags },
     -- { load_balancer = { type = "foreign", reference = "load_balancers" } },
   },
+
+  entity_checks = {
+    { conditional = { if_field = "protocol",
+                      if_match = { one_of = { "tcp", "tls" }},
+                      then_field = "path",
+                      then_match = { eq = ngx.null }}},
+  },
+
+  shorthands = {
+    { url = function(sugar_url)
+              local parsed_url = url.parse(tostring(sugar_url))
+              if not parsed_url then
+                return
+              end
+
+              return {
+                protocol = parsed_url.scheme,
+                host = parsed_url.host,
+                port = tonumber(parsed_url.port) or
+                       parsed_url.port or
+                       (parsed_url.scheme == "http" and 80) or
+                       (parsed_url.scheme == "https" and 443) or
+                       nil,
+                path = parsed_url.path,
+              }
+            end },
+  }
 }

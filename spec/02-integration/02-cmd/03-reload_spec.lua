@@ -1,11 +1,11 @@
 local helpers = require "spec.helpers"
 
 describe("kong reload", function()
-  setup(function()
-    assert(helpers.dao:run_migrations())
+  lazy_setup(function()
+    helpers.get_db_utils(nil, {}) -- runs migrations
     helpers.prepare_prefix()
   end)
-  teardown(function()
+  lazy_teardown(function()
     helpers.clean_prefix()
   end)
   after_each(function()
@@ -26,9 +26,9 @@ describe("kong reload", function()
     assert.equal(nginx_pid, helpers.file.read(helpers.test_conf.nginx_pid))
   end)
   it("reloads from a --conf argument", function()
-    assert(helpers.start_kong {
+    assert(helpers.start_kong({
       proxy_listen = "0.0.0.0:9002"
-    })
+    }, nil, true))
 
     -- http_client errors out if cannot connect
     local client = helpers.http_client("0.0.0.0", 9002, 5000)
@@ -53,9 +53,9 @@ describe("kong reload", function()
     client:close()
   end)
   it("accepts a custom nginx template", function()
-    assert(helpers.start_kong {
+    assert(helpers.start_kong({
       proxy_listen = "0.0.0.0:9002"
-    })
+    }, nil, true))
 
     -- http_client errors out if cannot connect
     local client = helpers.http_client("0.0.0.0", 9002, 5000)

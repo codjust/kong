@@ -1,79 +1,107 @@
-local find = string.find
--- entries must have colons to set the key and value apart
-local function check_for_value(value)
-  for i, entry in ipairs(value) do
-    local ok = find(entry, ":")
-    if not ok then
-      return false, "key '" .. entry .. "' has no value"
+local typedefs = require "kong.db.schema.typedefs"
+local validate_header_name = require("kong.tools.utils").validate_header_name
+
+
+local function validate_headers(pair, validate_value)
+  local name, value = pair:match("^([^:]+):*(.-)$")
+  if validate_header_name(name) == nil then
+    return nil, string.format("'%s' is not a valid header", tostring(name))
+  end
+
+  if validate_value then
+    if validate_header_name(value) == nil then
+      return nil, string.format("'%s' is not a valid header", tostring(value))
     end
   end
   return true
 end
 
-local function check_method(value)
-  if not value then
-    return true
-  end
-  local method = value:upper()
-  local ngx_method = ngx["HTTP_" .. method]
-  if not ngx_method then
-    return false, method .. " is not supported"
-  end
-  return true
+
+local function validate_colon_headers(pair)
+  return validate_headers(pair, true)
 end
 
-return {
+
+local strings_array = {
+  type = "array",
+  default = {},
+  elements = { type = "string" },
+}
+
+
+local headers_array = {
+  type = "array",
+  default = {},
+  elements = { type = "string", custom_validator = validate_headers },
+}
+
+
+local strings_array_record = {
+  type = "record",
   fields = {
-    http_method = {type = "string", func = check_method},
-    remove = {
-      type = "table",
-      schema = {
+    { body = strings_array },
+    { headers = headers_array },
+    { querystring = strings_array },
+  },
+}
+
+
+local colon_strings_array = {
+  type = "array",
+  default = {},
+  elements = { type = "string", match = "^[^:]+:.*$" },
+}
+
+local colon_headers_array = {
+  type = "array",
+  default = {},
+  elements = { type = "string", match = "^[^:]+:.*$", custom_validator = validate_colon_headers },
+}
+
+
+local colon_header_value_array = {
+  type = "array",
+  default = {},
+  elements = { type = "string", match = "^[^:]+:.*$", custom_validator = validate_headers },
+}
+
+
+local colon_strings_array_record = {
+  type = "record",
+  fields = {
+    { body = colon_strings_array },
+    { headers = colon_header_value_array },
+    { querystring = colon_strings_array },
+  },
+}
+
+
+local colon_rename_strings_array_record = {
+  type = "record",
+  fields = {
+    { body = colon_strings_array },
+    { headers = colon_headers_array },
+    { querystring = colon_strings_array },
+  },
+}
+
+
+return {
+  name = "request-transformer",
+  fields = {
+    { run_on = typedefs.run_on_first },
+    { protocols = typedefs.protocols_http },
+    { config = {
+        type = "record",
         fields = {
-          body = {type = "array", default = {}}, -- does not need colons
-          headers = {type = "array", default = {}}, -- does not need colons
-          querystring = {type = "array", default = {}} -- does not need colons
+          { http_method = typedefs.http_method },
+          { remove  = strings_array_record },
+          { rename  = colon_rename_strings_array_record },
+          { replace = colon_strings_array_record },
+          { add     = colon_strings_array_record },
+          { append  = colon_strings_array_record },
         }
-      }
+      },
     },
-    rename = {
-      type = "table",
-      schema = {
-        fields = {
-          body = {type = "array", default = {}},
-          headers = {type = "array", default = {}},
-          querystring = {type = "array", default = {}}
-        }
-      }
-    },
-    replace = {
-      type = "table",
-      schema = {
-        fields = {
-          body = {type = "array", default = {}, func = check_for_value},
-          headers = {type = "array", default = {}, func = check_for_value},
-          querystring = {type = "array", default = {}, func = check_for_value}
-        }
-      }
-    },
-    add = {
-      type = "table",
-      schema = {
-        fields = {
-          body = {type = "array", default = {}, func = check_for_value},
-          headers = {type = "array", default = {}, func = check_for_value},
-          querystring = {type = "array", default = {}, func = check_for_value}
-        }
-      }
-    },
-    append = {
-      type = "table",
-      schema = {
-        fields = {
-          body = {type = "array", default = {}, func = check_for_value},
-          headers = {type = "array", default = {}, func = check_for_value},
-          querystring = {type = "array", default = {}, func = check_for_value}
-        }
-      }
-    }
   }
 }

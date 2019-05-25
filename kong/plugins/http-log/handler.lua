@@ -1,130 +1,190 @@
 local basic_serializer = require "kong.plugins.log-serializers.basic"
 local BasePlugin = require "kong.plugins.base_plugin"
+local BatchQueue = require "kong.tools.batch_queue"
 local cjson = require "cjson"
 local url = require "socket.url"
+local http = require "resty.http"
 
-local string_format = string.format
+
 local cjson_encode = cjson.encode
+local ngx_encode_base64 = ngx.encode_base64
+local table_concat = table.concat
+local fmt = string.format
+
 
 local HttpLogHandler = BasePlugin:extend()
 
+
 HttpLogHandler.PRIORITY = 12
-HttpLogHandler.VERSION = "0.1.0"
+HttpLogHandler.VERSION = "1.0.0"
 
-local HTTP = "http"
-local HTTPS = "https"
 
--- Generates the raw http message.
--- @param `method` http method to be used to send data
--- @param `content_type` the type to set in the header
--- @param `parsed_url` contains the host details
--- @param `body`  Body of the message as a string (must be encoded according to the `content_type` parameter)
--- @return raw http message
-local function generate_post_payload(method, content_type, parsed_url, body)
-  local url
-  if parsed_url.query then
-    url = parsed_url.path .. "?" .. parsed_url.query
-  else
-    url = parsed_url.path
-  end
-  local headers = string_format(
-    "%s %s HTTP/1.1\r\nHost: %s\r\nConnection: Keep-Alive\r\nContent-Type: %s\r\nContent-Length: %s\r\n",
-    method:upper(), url, parsed_url.host, content_type, #body)
+local queues = {} -- one queue per unique plugin config
 
-  if parsed_url.userinfo then
-    local auth_header = string_format(
-      "Authorization: Basic %s\r\n",
-      ngx.encode_base64(parsed_url.userinfo)
-    )
-    headers = headers .. auth_header
-  end
+local parsed_urls_cache = {}
 
-  return string_format("%s\r\n%s", headers, body)
-end
 
 -- Parse host url.
 -- @param `url` host url
--- @return `parsed_url` a table with host details like domain name, port, path etc
+-- @return `parsed_url` a table with host details:
+-- scheme, host, port, path, query, userinfo
 local function parse_url(host_url)
-  local parsed_url = url.parse(host_url)
+  local parsed_url = parsed_urls_cache[host_url]
+
+  if parsed_url then
+    return parsed_url
+  end
+
+  parsed_url = url.parse(host_url)
   if not parsed_url.port then
-    if parsed_url.scheme == HTTP then
+    if parsed_url.scheme == "http" then
       parsed_url.port = 80
-     elseif parsed_url.scheme == HTTPS then
+    elseif parsed_url.scheme == "https" then
       parsed_url.port = 443
-     end
+    end
   end
   if not parsed_url.path then
     parsed_url.path = "/"
   end
+
+  parsed_urls_cache[host_url] = parsed_url
+
   return parsed_url
 end
 
--- Log to a Http end point.
--- This basically is structured as a timer callback.
--- @param `premature` see openresty ngx.timer.at function
--- @param `conf` plugin configuration table, holds http endpoint details
--- @param `body` raw http body to be logged
--- @param `name` the plugin name (used for logging purposes in case of errors etc.)
-local function log(premature, conf, body, name)
-  if premature then
-    return
-  end
-  name = "[" .. name .. "] "
+
+-- Sends the provided payload (a string) to the configured plugin host
+-- @return true if everything was sent correctly, falsy if error
+-- @return error message if there was an error
+local function send_payload(self, conf, payload)
+  local method = conf.method
+  local timeout = conf.timeout
+  local keepalive = conf.keepalive
+  local content_type = conf.content_type
+  local http_endpoint = conf.http_endpoint
 
   local ok, err
-  local parsed_url = parse_url(conf.http_endpoint)
+  local parsed_url = parse_url(http_endpoint)
   local host = parsed_url.host
   local port = tonumber(parsed_url.port)
 
-  local sock = ngx.socket.tcp()
-  sock:settimeout(conf.timeout)
-
-  ok, err = sock:connect(host, port)
+  local httpc = http.new()
+  httpc:set_timeout(timeout)
+  ok, err = httpc:connect(host, port)
   if not ok then
-    ngx.log(ngx.ERR, name .. "failed to connect to " .. host .. ":" .. tostring(port) .. ": ", err)
-    return
+    return nil, "failed to connect to " .. host .. ":" .. tostring(port) .. ": " .. err
   end
 
-  if parsed_url.scheme == HTTPS then
-    local _, err = sock:sslhandshake(true, host, false)
+  if parsed_url.scheme == "https" then
+    local _, err = httpc:ssl_handshake(true, host, false)
     if err then
-      ngx.log(ngx.ERR, name .. "failed to do SSL handshake with " .. host .. ":" .. tostring(port) .. ": ", err)
+      return nil, "failed to do SSL handshake with " ..
+                  host .. ":" .. tostring(port) .. ": " .. err
     end
   end
 
-  ok, err = sock:send(generate_post_payload(conf.method, conf.content_type, parsed_url, body))
-  if not ok then
-    ngx.log(ngx.ERR, name .. "failed to send data to " .. host .. ":" .. tostring(port) .. ": ", err)
+  local res, err = httpc:request({
+    method = method,
+    path = parsed_url.path,
+    query = parsed_url.query,
+    headers = {
+      ["Host"] = parsed_url.host,
+      ["Content-Type"] = content_type,
+      ["Content-Length"] = #payload,
+      ["Authorization"] = parsed_url.userinfo and (
+        "Basic " .. ngx_encode_base64(parsed_url.userinfo)
+      ),
+    },
+    body = payload,
+  })
+  if not res then
+    return nil, "failed request to " .. host .. ":" .. tostring(port) .. ": " .. err
   end
 
-  ok, err = sock:setkeepalive(conf.keepalive)
-  if not ok then
-    ngx.log(ngx.ERR, name .. "failed to keepalive to " .. host .. ":" .. tostring(port) .. ": ", err)
-    return
+  -- always read response body, even if we discard it without using it on success
+  local response_body = res:read_body()
+  local success = res.status < 400
+  local err_msg
+
+  if not success then
+    err_msg = "request to " .. host .. ":" .. tostring(port) ..
+              " returned status code " .. tostring(res.status) .. " and body " ..
+              response_body
   end
+
+  ok, err = httpc:set_keepalive(keepalive)
+  if not ok then
+    -- the batch might already be processed at this point, so not being able to set the keepalive
+    -- will not return false (the batch might not need to be reprocessed)
+    kong.log.err("failed keepalive for ", host, ":", tostring(port), ": ", err)
+  end
+
+  return success, err_msg
 end
 
--- Only provide `name` when deriving from this class. Not when initializing an instance.
+
+local function json_array_concat(entries)
+  return "[" .. table_concat(entries, ",") .. "]"
+end
+
+
+local function get_queue_id(conf)
+  return fmt("%s:%s:%s:%s:%s:%s",
+             conf.http_endpoint,
+             conf.method,
+             conf.content_type,
+             conf.timeout,
+             conf.keepalive,
+             conf.retry_count,
+             conf.queue_size,
+             conf.flush_timeout)
+end
+
+
+-- Only provide `name` when deriving from this class,
+-- not when initializing an instance.
 function HttpLogHandler:new(name)
-  HttpLogHandler.super.new(self, name or "http-log")
+  name = name or "http-log"
+  HttpLogHandler.super.new(self, name)
+
+  self.name = name
 end
 
--- serializes context data into an html message body.
--- @param `ngx` The context table for the request being logged
--- @param `conf` plugin configuration table, holds http endpoint details
--- @return html body as string
-function HttpLogHandler:serialize(ngx, conf)
-  return cjson_encode(basic_serializer.serialize(ngx))
-end
 
 function HttpLogHandler:log(conf)
   HttpLogHandler.super.log(self)
 
-  local ok, err = ngx.timer.at(0, log, conf, self:serialize(ngx, conf), self._name)
-  if not ok then
-    ngx.log(ngx.ERR, "[" .. self._name .. "] failed to create timer: ", err)
+  local entry = cjson_encode(basic_serializer.serialize(ngx))
+
+  local queue_id = get_queue_id(conf)
+  local q = queues[queue_id]
+  if not q then
+    -- batch_max_size <==> conf.queue_size
+    local batch_max_size = conf.queue_size or 1
+    local process = function(entries)
+      local payload = batch_max_size == 1
+                      and entries[1]
+                      or  json_array_concat(entries)
+      return send_payload(self, conf, payload)
+    end
+
+    local opts = {
+      retry_count    = conf.retry_count,
+      flush_timeout  = conf.flush_timeout,
+      batch_max_size = batch_max_size,
+      process_delay  = 0,
+    }
+
+    local err
+    q, err = BatchQueue.new(process, opts)
+    if not q then
+      kong.log.err("could not create queue: ", err)
+      return
+    end
+    queues[queue_id] = q
   end
+
+  q:add(entry)
 end
 
 return HttpLogHandler

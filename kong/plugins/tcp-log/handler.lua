@@ -5,7 +5,7 @@ local cjson = require "cjson"
 local TcpLogHandler = BasePlugin:extend()
 
 TcpLogHandler.PRIORITY = 7
-TcpLogHandler.VERSION = "0.1.0"
+TcpLogHandler.VERSION = "1.0.0"
 
 local function log(premature, conf, message)
   if premature then
@@ -36,7 +36,7 @@ local function log(premature, conf, message)
     end
   end
 
-  ok, err = sock:send(cjson.encode(message) .. "\r\n")
+  ok, err = sock:send(cjson.encode(message) .. "\n")
   if not ok then
     ngx.log(ngx.ERR, "[tcp-log] failed to send data to " .. host .. ":" .. tostring(port) .. ": ", err)
   end
